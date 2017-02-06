@@ -6,36 +6,37 @@
 #define WATER_THRESH 100
 #define TEMP_THRESH  700 //+150
 #define IDLE_TIME 120000
+#define REFILL_TIMEOUT 5000 // how long to refill the watertank
 Adafruit_NeoPixel pixels = Adafruit_NeoPixel(NUMPIXELS, RGB_LED, NEO_GRB + NEO_KHZ800);
 short led_value = 0;
 bool spin = false;
-short temperature = 0;
-short water_level = 0;
+short temperature = 0; //contains the current temperature. init with low value to disable boiler at boot
+short water_level = 1000; // contains the current waterlevel. init with high value to disable pump at boot and update with real value
 short big_button = 0;
 short small_button = 1;
 long coffee_request = 0;
+long coffee_request_2 = 0; //logically this is not required, but feedback from refill relay, invokes a false positive on the button press
 bool hot = false;
 short boiler = 5;
 short pump = 6;
 short valve = 7;
 short led = 13;
 bool led_state = false;
-// states
+//// states
 short state = 1;
-short idle = 0;
-short no_water = 1;
-short refill = 2;
-short warm_up = 3;
-short ready_ = 4;
-short serving = 5;
-long last_edge = 0;
-long coffee_start = 0;
-long cur_time = 0;
-long last_interaction = 0;
-long last_log = -10000;
-long time_without_water = 0;
-long watering_time = 0;
-long last_coffee=0;
+short s_idle = 0;
+short s_prepare = 1;
+short s_ready = 2;
+short s_serve = 3;
+//// checks
+long refill_start = 0;
+
+long last_edge = 0;//last edge for led state
+long coffee_start = 0; //when we started the pump for serving the coffee
+long cur_time = 0; //current time
+long last_interaction = 0; //when a button was pressed the last time
+long last_log = -10000; //when the last log was sent
+long last_coffee = 0; // wait some time after last coffee
 void setup() {
   // relay 1
   pinMode(boiler, OUTPUT);
@@ -71,181 +72,92 @@ void setup() {
 }
 
 void coffee_big() {
-  setCoffeeRequest(BIG_COFFEE);  
+  setCoffeeRequest(BIG_COFFEE);
 }
 void coffee_small() {
   setCoffeeRequest(SMALL_COFFEE);
 }
-void setCoffeeRequest(short req){
+void setCoffeeRequest(short req) {
   last_interaction = millis();
-  if(coffee_request != 0){
+  if (coffee_request != 0) {
     return;
   }
-  if(millis()-last_coffee < 1000){
+  if (millis() - last_coffee < 1000) {
     //wait some time until last coffee has finished;
     return;
   }
+  Serial.println("set coffee req");
   coffee_request = req;
-  
+
 }
 void loop() {
   cur_time = millis();
-  if(cur_time<200) // no request during boot
+  if (cur_time < 200) // no request during boot
     coffee_request = 0;
-  water_level = water_level * 0.9 + 0.1 * analogRead(A0);
+
 
   if (cur_time - last_log > 2000) {
     last_log = cur_time;
     Serial.print("state ");
     Serial.print(state);
-    Serial.print(" temperature ");
+    Serial.print(" temp ");
     Serial.print(temperature);
-    Serial.print(" water_level ");
+    Serial.print(" water ");
     Serial.print(water_level);
-    Serial.print(" hot ");
-    Serial.print(hot);
-    Serial.print(" coffee request: ");
-    Serial.print(coffee_request);
+    //Serial.print(" hot ");
+    //Serial.print(hot);
+    int hotness = min(64, max((temperature - 400), 0) * 64 / 300);
+    Serial.print(" hotness ");
+    Serial.println(hotness);
+    if (coffee_request != 0) {
+      Serial.print(" coffee request: ");
+      Serial.print(coffee_request_2 - (cur_time - coffee_start) / 1000);
+    }
     Serial.println();
   }
   // check for any interaction
-
-  if (cur_time - last_interaction > IDLE_TIME) {
-
-    if (state != idle)
-      Serial.println("idling");
-    state = idle;
-  }
+  idleCheck();
+  // check if there is sufficient water
+  waterCheck();
+  // checkTemperature
+  tempCheck();
 
   // if no interaction has been recognized for 2 min the boiler is turned off.
-  if (state == idle) {
-    digitalWrite(boiler, HIGH);
-    digitalWrite(pump, HIGH);
-    digitalWrite(valve, LOW);
-    if (cur_time - last_interaction < IDLE_TIME) {
-      state = no_water;
-      coffee_request = 0;
-      temperature = TEMP_THRESH;
-      water_level = WATER_THRESH;
-      Serial.println("going back to start -> no water");
-    }
-  }
-
-  // check if there is sufficient water
-  if (state >= no_water) { //if not idle
-    if (water_level < WATER_THRESH) {
-      if (state != no_water && state != refill) {
-        Serial.println("no_water");
-      }
-
-      if (state == serving) { //emergency refill
-        Serial.println("emergency refill");
-        watering_time = cur_time;
-        digitalWrite(valve,HIGH); 
-        do_refill(cur_time, true);
-      }
-      else {
-        if (state != refill) {
-          state = no_water; //no water
-        }
-      }
-    }
-    else { //enough water
-      digitalWrite(valve, LOW);
-      time_without_water = cur_time;
-      if (state == no_water) {
-        state = warm_up; // water -> warm up water
-        Serial.println("going to warm-up");
-        delay(500);
-      }
-    }
-  }
-
-  // if there is no water. turn off boiler and pump
-  if (state == no_water) {
-    digitalWrite(boiler, HIGH);
-    digitalWrite(pump, HIGH);
-    if (cur_time - time_without_water > 5000) {
-      time_without_water = cur_time;
-      //if there has been no water for 5 sec -> activate valve
-      Serial.println("go to refill");
-      state = refill;
-      watering_time = cur_time;
-      digitalWrite(valve,HIGH);
-    }
-
-  }
-  if (state == refill) {
-    do_refill(cur_time, false);
-  }
-
-  // if there is water and we are in not idling, then heat up until we reach temperature.
-  if (state >= warm_up) {
-    checkTemperature();
-  }
-  // if water is hot, show ready
-  if ((state == warm_up) && hot) {
-    state = ready_;
-    Serial.println("going to ready from warm_up");
-  }
-
+  if (state == s_idle)
+    idleState();
+  // check prepare some hot water before starting
+  if (state == s_prepare)
+    prepareState();
   // if we are ready check, if there has been a coffee request and start pump
-  if (state == ready_) {
-    if (coffee_request) {
-      Serial.print("start serving coffee ");
-      Serial.println(coffee_request);
-      state = serving;
-      coffee_start = cur_time;
-      digitalWrite(pump, LOW);
-    }
-  }
+  if (state == s_ready)
+    readyState();
 
   // serving coffee. deactivate pump as soon as the time for a coffee has been reached.
   //double time for big coffee
-  if (state == serving) {
-    if (cur_time - coffee_start > (coffee_request * 1000)) {
-      Serial.println("coffee done");
-      digitalWrite(pump, HIGH);
-      state = no_water; // start from beginning
-      coffee_request = 0;
-      last_coffee = cur_time;
-      last_interaction = cur_time;
-    }
-  }
+  if (state == s_serve)
+    serveState();
+
   //display the state with the led
   showState();
   delay(50);
 }
 ///////////////////HELPER FUNCTIONS//////////////////////
 void showState() {
-  if (state == ready_) {
-    setLed(true);
+  if (state == s_ready) {
     pixels.setPixelColor(0, pixels.Color(0, 150, 0));
   }
-  if (state == serving) {
-    setLed(true);
-    pixels.setPixelColor(0, pixels.Color(100, 0, 100));
-  }
-  if (state == refill) {
+  if (state == s_serve) {
     pixels.setPixelColor(0, pixels.Color(100, 100, 0));
   }
-  if (state == warm_up) {
+  if (state == s_prepare) {
     if (millis() - last_edge > 800) { // blink every 800ms
-      led_state = !led_state;
-      setLed(led_state);
+      int hotness = min(64, max((temperature - 400), 0) * 64 / 300);
+
+      pixels.setPixelColor(0, pixels.Color(hotness, 0, hotness - 64));
     }
   }
-  if (state == no_water) {
-    if (millis() - last_edge > 300) { //blink every 300 ms
-      led_state = !led_state;
-      setLed(led_state);
-
-    }
-  }
-  if (state == idle) {
-    setLed(false);
-
-    if (led_value >= 64)
+  if (state == s_idle) {
+    if (led_value >= 50)
       spin = true;
     if (led_value <= 0)
       spin = false;
@@ -258,50 +170,5 @@ void showState() {
   pixels.show();
 }
 
-void checkTemperature() {
-  temperature = analogRead(A1);
-  int threshold = TEMP_THRESH;
-  if (state!=warm_up)
-    threshold= TEMP_THRESH+150;
-  if (temperature > threshold + 5) {
-    hot = true;
-    digitalWrite(boiler, HIGH);
-  }
-  if (temperature < threshold - 5) {
-    hot = false;
-    digitalWrite(boiler, LOW);
-  }
-}
-void setLed(bool led_state) {
-  last_edge = millis();
-  //digitalWrite(led, led_state);
-  if (led_state) {
-    //analogWrite(A2,675); //approx 3.3V
-    if (state == no_water)
-      pixels.setPixelColor(0, pixels.Color(0, 0, 128));
 
-  }
-  else {
-    //analogWrite(A2,0);
-    if (state == no_water)
-      pixels.setPixelColor(0, pixels.Color(0, 0, 0));
-  }
-  if (state == warm_up) {
-    int hotness = temperature / 8;
-    pixels.setPixelColor(0, pixels.Color(hotness, 0, hotness - 128));
-  }
-}
-
-
-void do_refill(long &cur_time, bool emergency_refill) {
-  if (cur_time - watering_time > 6000) {
-    digitalWrite(valve,LOW);
-    if (!emergency_refill) {
-      state = no_water; //check again
-      coffee_request = 0;//just in case 
-    }
-    else
-      Serial.println("refilled");
-  }
-}
 
